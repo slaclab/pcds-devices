@@ -1,3 +1,4 @@
+import functools
 import os
 import select
 import shutil
@@ -209,3 +210,26 @@ def schedule_task(func, args=None, kwargs=None, delay=None):
         # Do it later
         timer = threading.Timer(delay, schedule)
         timer.start()
+
+
+def stop_on_keyboardinterrupt(func):
+    """
+    Decorator that runs the object's `stop` method if a keyboard interrupt is
+    caught. This is meant to be used on ophyd device methods and expects the
+    first argument to be `self`.
+    """
+    @functools.wraps(func)
+    def wrapped(self, *args, **kwargs):
+        if not hasattr(self, "stop") or not callable(self.stop):
+            raise AttributeError(
+                f"Object '{self.name}' needs a stop method to use the "
+                f"stop_on_keyboardinterrupt decorator."
+            )
+        try:
+            return func(self, *args, **kwargs)
+        except KeyboardInterrupt:
+            self.stop()
+            self.log.info("Device '%s' stopped by keyboard interrupt",
+                          self.name)
+
+    return wrapped
