@@ -4,6 +4,7 @@ Module for common target stage stack configurations.
 import logging
 import numpy as np
 from datetime import datetime
+import os
 
 from ophyd.device import Device
 import json
@@ -587,20 +588,16 @@ class XYGridStage():
         samples : list
             List of strings of all the sample names available.
         """
+        samples = []
         path = path or self._path
-        with open(path) as sample_file:
-            try:
-                data = yaml.safe_load(sample_file)
-                if not data:
-                    logger.info('The file is empty, no samples saved yet.')
-                    return []
-                return list(data.keys())
-            except yaml.YAMLError as err:
-                logger.error('Error when loading the samples yaml file: %s',
-                             err)
-                raise err
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_file():
+                    samples.append(entry.name.split('.yml')[0])
+        return samples
 
-    def get_current_sample(self):
+    @property
+    def current_sample(self):
         """
         Get the current sample that is loaded.
 
@@ -611,7 +608,8 @@ class XYGridStage():
         """
         return self._current_sample
 
-    def set_current_sample(self, sample_name):
+    @current_sample.setter
+    def current_sample(self, sample_name):
         """
         Set the current sample.
 
@@ -622,7 +620,63 @@ class XYGridStage():
         """
         self._current_sample = str(sample_name)
 
-    def load_sample(self, sample_name, path=None):
+    @property
+    def status(self):
+        x_index = ''
+        y_index = ''
+        x_pos = self.x.position
+        y_pos = self.y.position
+        data = self.get_sample_data(self.current_sample)
+        try:
+            xx = data['xx']
+            yy = data['yy']
+
+            x_index = next((index for (index, d) in enumerate(xx)
+                            if np.isclose(d["pos"], x_pos)))
+            y_index = next((index for (index, d) in enumerate(yy)
+                            if np.isclose(d["pos"], y_pos)))
+        except Exception:
+            logger.warning('Could not determine the m n points from position.')
+        n_points = self.m_n_points[1]
+
+        x_index += 1
+        m = int(np.ceil(x_index / n_points))
+        res = np.mod(x_index, 2 * n_points)
+        if res == 0:
+            n = 1
+        elif res <= n_points:
+            n = res
+        else:
+            n = 2 * n_points - (res + 1)
+
+        if x_index != '':
+            # to start from 1 instead of 0
+            x_index = n
+        if y_index != '':
+            y_index = m
+        lines = []
+        sample = f'current_sample: {self.current_sample}'
+        grid = f'grid M x N: {self.m_n_points}'
+        m_n = f'current m, n : {y_index, x_index}'
+        lines.extend([sample, grid, m_n])
+
+        print('\n'.join(lines))
+
+    @property
+    def current_sample_path(self):
+        """
+        Get the current path for the sample that is loaded.
+
+        Returns
+        -------
+        sample: dict
+        Dictionary with current sample information.
+        """
+        if self._current_sample != '':
+            return os.path.join(self._path, self._current_sample + '.yml')
+        raise ValueError('No current sample loaded, please use load() first.')
+
+    def load(self, sample_name, path=None):
         """
         Get the sample information and populate these parameters.
 
@@ -638,12 +692,13 @@ class XYGridStage():
             Path where the samples yaml file exists.
         """
         path = path or self._path
+        entry = os.path.join(path, sample_name + '.yml')
         m_points, n_points, coeffs = self.get_sample_map_info(
-                                            str(sample_name), path)
+                                            str(sample_name), path=entry)
         self.m_n_points = m_points, n_points
         self.coefficients = coeffs
         # make this sample the current one
-        self.set_current_sample(str(sample_name))
+        self.current_sample = str(sample_name)
 
     def get_sample_data(self, sample_name, path=None):
         """
@@ -687,7 +742,7 @@ class XYGridStage():
         yy:
         ...}
         """
-        path = path or self._path
+        path = path or os.path.join(self._path, sample_name + '.yml')
         data = None
         with open(path) as sample_file:
             try:
@@ -720,8 +775,8 @@ class XYGridStage():
         path : str, optional
             Path to the samples yaml file.
         """
-        path = path or self._path
-        sample = self.get_sample_data(str(sample_name))
+        path = path or os.path.join(self._path, sample_name + '.yml')
+        sample = self.get_sample_data(str(sample_name), path=path)
         coeffs = []
         m_points, n_points = 0, 0
         if sample:
@@ -743,14 +798,14 @@ class XYGridStage():
 
     def save_grid(self, sample_name, path=None):
         """
-        Save a grid of mapped points for a sample.
+        Save a grid file of mapped points for a sample.
 
         This will save the date it was created, along with the sample name,
         the m and n points, the coordinates for the four corners, and the
         coefficients that will help get the x and y position on the grid.
 
         If an existing name for a sample is saved again, it will override
-        the information for that sample keeping the status of the targets.
+        the information for that samplefile keeping the status of the targets.
         When overriding a sample, this is assuming that a re-calibration was
         needed for that sample, so in case we have already shot targets from
         that sample - we want to keep track of that.
@@ -760,20 +815,21 @@ class XYGridStage():
         sample_name : str
             A name to identify the sample grid, should be snake_case style.
         path : str, optional
-            Path to the `.yml` file. Defaults to the path defined when
-            creating this object.
+            Path to the sample folder where this sample will be saved.
+            Defaults to the path defined when creating this object.
 
         Examples
         --------
         >>> save_grid('sample_1')
         """
         path = path or self._path
+        entry = os.path.join(path, sample_name + '.yml')
         now = str(datetime.now())
         top_left, top_right, bottom_right, bottom_left = [], [], [], []
-        flat_xx, flat_yy = [], []
         if self.get_presets():
             top_left, top_right, bottom_right, bottom_left = self.get_presets()
         xx, yy = self.positions_x, self.positions_y
+        flat_xx, flat_yy = [], []
         if xx and yy:
             flat_xx = [float(x) for x in xx]
             flat_yy = [float(y) for y in yy]
@@ -798,18 +854,19 @@ class XYGridStage():
         except jsonschema.exceptions.ValidationError as err:
             logger.warning('Invalid input: %s', err)
             raise err
-        # override the existing sample grids or append other grids
-        # check to see if sample exists already
-        with open(path) as sample_file:
-            yaml_dict = yaml.safe_load(sample_file) or {}
-            sample = yaml_dict.get(sample_name)
-            if sample:
+        # entry = os.path.join(path, sample_name + '.yml')
+        # if this is an existing file, overrite the info but keep the statuses
+        if os.path.isfile(entry):
+            with open(entry) as sample_file:
+                yaml_dict = yaml.safe_load(sample_file)
+                sample = yaml_dict[sample_name]
                 # when overriding the same sample, this is assuming that a
                 # re-calibration was done - so keep the previous statuses.
                 temp_xx = sample['xx']
                 temp_yy = sample['yy']
                 temp_x_status = [i['status'] for i in temp_xx]
                 temp_y_status = [i['status'] for i in temp_yy]
+                # update the current data statuses with previous ones
                 for xd, status in zip(data[sample_name]['xx'], temp_x_status):
                     xd.update((k, status)
                               for k, v in xd.items() if k == 'status')
@@ -817,11 +874,14 @@ class XYGridStage():
                     yd.update((k, status)
                               for k, v in yd.items() if k == 'status')
                 yaml_dict.update(data)
-            else:
-                yaml_dict.update(data)
-        with open(path, 'w') as sample_file:
-            yaml.safe_dump(yaml_dict, sample_file,
-                           sort_keys=False, default_flow_style=False)
+            with open(entry, 'w') as sample_file:
+                yaml.safe_dump(data, sample_file,
+                               sort_keys=False, default_flow_style=False)
+        else:
+            # create a new file
+            with open(entry, 'w') as sample_file:
+                yaml.safe_dump(data, sample_file,
+                               sort_keys=False, default_flow_style=False)
 
     def reset_statuses(self, sample_name, path=None):
         """
@@ -835,7 +895,7 @@ class XYGridStage():
             Path to the `.yml` file. Defaults to the path defined when
             creating this object.
         """
-        path = path or self._path
+        path = path or os.path.join(self._path, sample_name + '.yml')
         with open(path) as sample_file:
             yaml_dict = yaml.safe_load(sample_file) or {}
             sample = yaml_dict.get(sample_name)
@@ -922,13 +982,47 @@ class XYGridStage():
         self.positions_y = y_points
         return x_points, y_points
 
-    def compute_mapped_point(self, sample_name, m_row, n_column,
-                             compute_all=False, path=None):
+    def is_target_shot(self, m, n, sample=None, path=None):
+        """
+        Check to see if the target position at MxN is shot.
+
+        Parameters
+        ----------
+        sample_name : str, optional
+            The name of the sample to get the mapped points from. To see the
+            available mapped samples call the `mapped_samples()` method.
+        m_point : int
+            Represents the row value of the point we want the position for.
+        n_point : int
+            Represents the column value of the point we want the position for.
+        path : str, optional
+            Sample path.
+
+        Returns
+        -------
+        is_shot : bool
+            Indicates is target is shot or not.
+        """
+        sample = sample or self.current_sample
+        path = path or self.current_sample_path
+        x, y = self.compute_mapped_point(m_row=m,
+                                         n_column=n,
+                                         sample_name=sample, path=path)
+
+        data = self.get_sample_data(sample)
+        xx = data.get('xx')
+        x_status = None
+        # one value should be enough
+        # TODO: this is assuming that none of the points will be the unique.
+        if xx is not None:
+            x_status = next((item['status']
+                             for item in xx if item['pos'] == x), None)
+        return x_status
+
+    def compute_mapped_point(self, m_row, n_column, sample_name=None,
+                             path=None, compute_all=False):
         """
         For a given sample, compute the x, y position for M and N respecively.
-
-        If `compute_all` is True, than compute all the point positions
-        for this sample.
 
         Parameters
         ----------
@@ -948,18 +1042,30 @@ class XYGridStage():
         -------
         x, y : tuple
             The x, y position for m n location.
-            Or, all the xx, yy values if `compute_all` is `True`.
         """
-        # TODO: do not check the m and n if compute_all=True
         path = path or self._path
+        sample_name = sample_name or self.current_sample
 
-        m_points, n_points, coeffs = self.get_sample_map_info(
-                                            str(sample_name), path=path)
+        if sample_name is None or sample_name == '':
+            raise ValueError(
+                'Please make sure you provide a sample name or use load()')
+        # if we have a current loaded sample, use the current M, N values and
+        # current coefficients
+        if self.current_sample != '':
+            m_points, n_points = self.m_n_points
+            coeffs = self.coefficients
+        else:
+            # try to get them from the sample_name file
+            entry = os.path.join(path, sample_name + '.yml')
+            m_points, n_points, coeffs = self.get_sample_map_info(
+                str(sample_name), path=entry)
+
         if any(v is None for v in [m_points, n_points, coeffs]):
             raise ValueError('Some values are empty, please check the sample '
-                             f'{sample_name} in the yaml file.')
+                             f'{sample_name} in the has the M and N values as '
+                             'well as coefficients saved')
 
-        if (m_row > m_points) and (n_column > n_points):
+        if (m_row > m_points) or (n_column > n_points):
             raise IndexError('Index out of range, make sure the m and n values'
                              f' are between ({m_points, n_points})')
         if (m_row or n_column) == 0:
@@ -976,60 +1082,24 @@ class XYGridStage():
             logic_y = yy_origin[m_row - 1][n_column - 1]
             x, y = convert_to_physical(a_coeffs, b_coeffs, logic_x, logic_y)
             return x, y
-
-        # compute all points
-        x_points, y_points = [], []
-        for rowx, rowy in zip(xx_origin, yy_origin):
-            for x, y in zip(rowx, rowy):
-                i, j = convert_to_physical(a_coeffs=a_coeffs,
-                                           b_coeffs=b_coeffs,
-                                           logic_x=x, logic_y=y)
-                x_points.append(i)
-                y_points.append(j)
-        return x_points, y_points
-
-    def is_target_shot(self, sample, m, n, path=None):
-        """
-        Check to see if the target position at MxN is shot.
-
-        Parameters
-        ----------
-        sample_name : str
-            The name of the sample to get the mapped points from. To see the
-            available mapped samples call the `mapped_samples()` method.
-        m_point : int
-            Represents the row value of the point we want the position for.
-        n_point : int
-            Represents the column value of the point we want the position for.
-        path : str, optional
-            Sample path.
-
-        Returns
-        -------
-        is_shot : bool
-            Indicates is target is shot or not.
-        """
-        path = path or self._path
-        x, y = self.compute_mapped_point(sample_name=sample, m_row=m,
-                                         n_column=n, compute_all=False,
-                                         path=path)
-
-        data = self.get_sample_data(sample)
-        xx = data.get('xx')
-        x_status = None
-        # one value should be enough
-        # TODO: this is assuming that none of the points will be the unique.
-        if xx is not None:
-            x_status = next((item['status']
-                             for item in xx if item['pos'] == x), None)
-        return x_status
+        else:
+            # compute all points
+            x_points, y_points = [], []
+            for rowx, rowy in zip(xx_origin, yy_origin):
+                for x, y in zip(rowx, rowy):
+                    i, j = convert_to_physical(a_coeffs=a_coeffs,
+                                               b_coeffs=b_coeffs,
+                                               logic_x=x, logic_y=y)
+                    x_points.append(i)
+                    y_points.append(j)
+            return x_points, y_points
 
     def move_to_sample(self, m, n):
         """
         Move x,y motors to the computed positions of n, m of current sample.
 
         Given m (row) and n (column), compute the positions for x and y based
-        on the current sample's parameters. See `get_current_sample()` and move
+        on the current sample's parameters. See `current_sample` and move
         the x and y motor to those positions.
 
         Parameters
@@ -1039,11 +1109,9 @@ class XYGridStage():
         n : int
             Indicates the column on the grid.
         """
-        sample_name = self.get_current_sample()
+        sample_name = self.current_sample
         if sample_name:
-            n, m = self.compute_mapped_point(sample_name, m_row=m, n_column=n,
-                                             compute_all=False, path=None)
-        # TODO is it safe to do this here or should i be adding some checks?
+            n, m = self.compute_mapped_point(m_row=m, n_column=n)
         self.x.mv(n)
         self.y.mv(m)
 
@@ -1052,7 +1120,7 @@ class XYGridStage():
         Move x,y motors to the computed positions of n, m of given sample.
 
         Given m (row) and n (column), compute the positions for x and y based
-        on the current sample's parameters. See `get_current_sample()`
+        on the current sample's parameters. See `current_sample`
 
         Parameters
         ----------
@@ -1061,10 +1129,70 @@ class XYGridStage():
         n : int
             Indicates the column on the grid.
         """
-        n, m = self.compute_mapped_point(str(sample), m_row=m, n_column=n,
-                                         compute_all=False, path=None)
+        entry = os.path.join(self._path, sample + '.yml')
+        n, m = self.compute_mapped_point(m_row=m, n_column=n,
+                                         sample_name=sample, path=entry)
         self.x.mv(n)
         self.y.mv(m)
+
+    def set_status(self, m, n, status=False, sample_name=None, path=None):
+        """
+        TODO not working properly yet
+        Set the status for a specific m and n point.
+
+        Parametrs:
+        ---------
+        m : int
+            Indicates the row number starting at 1.
+        n : int
+            Indicates the column number starting at 1.
+        status : bool, optional
+            `False` to indicate that is has been shot, and `True` for
+            available.
+        """
+        assert isinstance(status, bool)
+        sample_name = sample_name or self.current_sample
+        path = path or os.path.join(self._path, sample_name + '.yml')
+        m_points, n_points = self.m_n_points
+
+        if (m > m_points) or (n > n_points):
+            raise IndexError('Index out of range, make sure the m and n values'
+                             f' are between ({m_points, n_points})')
+        if (m or n) == 0:
+            raise IndexError('Please start at 1, 1, as the initial points.')
+
+        with open(path) as sample_file:
+            yaml_dict = yaml.safe_load(sample_file) or {}
+            sample = yaml_dict.get(sample_name)
+            if sample:
+                xx = sample['xx']
+                yy = sample['yy']
+
+                n_pos = next(d['pos'] for (index, d) in enumerate(xx)
+                             if index == n - 1)
+
+                m_pos = next(d['pos'] for (index, d) in enumerate(yy)
+                             if index == m - 1)
+
+                for xd in sample.get('xx'):
+                    for k, v in xd.items():
+                        if k == 'pos' and v == n_pos:
+                            xd.update((st, status)
+                                      for st, vv in xd.items()
+                                      if st == 'status')
+                for yd in sample.get('yy'):
+                    for k, v in yd.items():
+                        if k == 'pos' and v == m_pos:
+                            yd.update((st, status)
+                                      for st, vv in xd.items()
+                                      if st == 'status')
+                yaml_dict[sample_name].update(sample)
+            else:
+                raise ValueError('Could not find this sample name in the file:'
+                                 f' {sample}')
+        with open(path, 'w') as sample_file:
+            yaml.safe_dump(yaml_dict, sample_file,
+                           sort_keys=False, default_flow_style=False)
 
 
 def mesh_interpolation(top_left, top_right, bottom_right, bottom_left):
